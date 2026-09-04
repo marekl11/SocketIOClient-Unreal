@@ -42,6 +42,14 @@ void FSocketIONative::Connect(const FSIOConnectParams& InConnectParams)
 	}
 
 	SyncPrivateClientToTLSMode(URLParams.AddressAndPort);
+
+	//Belt and braces for the listener install. The client is normally handed out by
+	//FSocketIOClientModule::NewValidNativePointer(), which sets the listeners up once the shared
+	//pointer exists — but FSocketIONative is public API, so a caller can own one it built itself
+	//and never go through the factory. Redoing it here costs a few assignments and makes the
+	//object correct however it was created. Idempotent: sio just overwrites each listener slot,
+	//and this touches none of the user callbacks or the event map.
+	SetupInternalCallbacks();
 	
 	//Fill std types before going to background thread.
 
@@ -518,8 +526,18 @@ void FSocketIONative::SetupInternalCallbacks()
 	//covers both: nothing in the listener touches a member until Pin() has succeeded, and the
 	//pin then keeps the object alive for the rest of the body.
 	//
-	//Safe to call AsShared() here — both callers (ClearAllCallbacks and RebindCurrentEventMap)
-	//run well after construction.
+	//AsShared() needs this object to already be owned by a TSharedPtr, and one caller runs
+	//before that is true: the constructor calls ClearAllCallbacks(), which lands here while
+	//MakeShareable() has not yet wrapped the object — AsShared() would assert on
+	//DoesSharedInstanceExist(). Bail out on that pass; FSocketIOClientModule::NewValidNativePointer()
+	//calls ClearAllCallbacks() again the moment the shared pointer exists, which installs the
+	//listeners for real. Every other caller (ClearAllCallbacks and RebindCurrentEventMap after
+	//construction) proceeds normally.
+	if (!DoesSharedInstanceExist())
+	{
+		return;
+	}
+
 	TWeakPtr<FSocketIONative> WeakSelf = AsShared();
 
 	PrivateClient->set_open_listener(sio::client::con_listener([]()
